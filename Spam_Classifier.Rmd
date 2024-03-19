@@ -1,0 +1,411 @@
+---
+title: "Spotlight: SMS Spam Classifier"
+author: Swagat Malla
+output:
+  pdf_document: default
+  html_document: default 
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+
+#load necessary packages
+library(tidyverse)
+library(tidymodels)
+library(glmnet)
+library(vip)
+library(stats)
+library(tidytext)
+library(stringi)
+library(qdapRegex)
+library(ggpubr)
+library(rpart)
+library(rpart.plot)
+library(ranger)
+
+#loading in data
+msg_tbl <- as_tibble(read.csv("~/spam.csv"))
+```
+
+## Introduction
+
+Every day we get a lot of messages on our phones. Most of the times they are genuine messages from our friends, family, and other contacts, but we also do receive unwanted spam messages.The concept of spam is rather subjective; however, we can agree that most of the times these are advertisements, scams, money making schemes, pornography, and so on. 
+
+In this project, we use the *SMS Spam Collection Data Set*-- made available by the University of California, Irvine Machine Learning Repository-- that contains 5574 SMS messages that are classified as *spam* or *ham* (genuine message). A quick look at the documentation tells us that the texts were collected from people in the UK and Singapore.
+
+Using the texts, we will generate features, which we will use to train and evaluate our classification model. We will first use Lasso regularization technique for our binomial logistic regression.
+
+
+## Data Tidying
+
+To begin with, we have five columns in total. The first two are straight forward- `v1` is the classification column and `v2`contains the texts. The last three columns, however, contain a lot of blank entries, they do not seem to add a lot of value to the data set. So, we get rid of them and rename the rest of the attributes appropriately. There also seem to be duplicated instance where the texts are repeated, so we leave them out. Furthermore, we convert our target variable `type` into a factor.
+
+```{r, include = FALSE}
+sum(msg_tbl[3:5] == "")
+
+msg_tbl[3:5] %>%
+  filter(X != "" | X.1 != "" | X.2 != "")
+
+#16648 blank values in total delete the columns
+msg_tbl <- msg_tbl[-1 * (3:5)]
+
+#remove duplicated texts
+dupe_vec <- !(duplicated(msg_tbl))
+msg_tbl <- msg_tbl[dupe_vec,]
+
+#rename
+msg_tbl <- msg_tbl %>%
+  rename(
+    "type" = "v1",
+    "text" = "v2") 
+
+spam_levels <- c("spam", "ham")
+
+msg_tbl <- msg_tbl %>%
+  mutate(type = factor(type, levels = spam_levels)) #factorize the target
+```
+
+
+## Feature Engineering
+
+To make a machine learning model, we will need attributes that describe each observation of SMS text, so let's generate some features from the raw texts. To achieve this, we can use different kinds of counts. For instance, every text is composed of characters such as alphabets, numbers, signs, etc; we can count them! Here I have included counts of characters, words, sentences, numbers, and upper case letters. Going through the raw texts, we can see few instances where users have used emoticons (special characters to represent facial characters such as :-)). There are also texts that include currency symbols like `£`, which makes sense given that a lot of the users were British. Thus, it is reasonable to guess that there might be some texts with dollar signs `$` as some users were from Singapore. For emoticons and currency symbols, we can use regular expressions to find the case we are looking for. For emoticons, `qdapRegex` library (which contains a dictionary of regular expressions) comes in handy. The process for creating few of the variables is shown below. 
+
+
+```{r, results = 'hide'}
+#give a unique id for each text
+msg_tbl <- msg_tbl %>%
+  mutate(id = 1:nrow(msg_tbl))
+
+#count of total characters, numbers, uppercase characters, and sentences 
+msg_tbl <- msg_tbl %>%
+  mutate(char_count  = nchar(text), 
+         num_count = str_count(text, "[0-9]"), 
+         upperCase_count = str_count(text, "[A-Z]"))
+
+sentence_tbl <- msg_tbl %>%
+  unnest_tokens(word, text, token = "sentences") %>%
+  group_by(id) %>%
+  summarize(sentences_count = n())
+
+msg_tbl <- msg_tbl %>%
+  left_join(sentence_tbl, by = "id")
+
+```
+
+```{r, include = FALSE }
+#emoticons
+msg_tbl <- msg_tbl %>%
+  mutate(has_emoticon = ifelse(grepl(grab("@rm_emoticon"), msg_tbl$text), 1, 0))%>%
+           mutate(has_emoticon = factor(has_emoticon))
+
+#word count
+word_tbl <- msg_tbl %>%
+  unnest_tokens(word, text) %>%
+  group_by(id) %>%
+  summarize(word_count = n())
+ 
+msg_tbl <- msg_tbl %>%
+  left_join(word_tbl, by = "id")
+  
+
+#pounds  and dollars
+msg_tbl <- msg_tbl %>%
+  mutate(has_pound =  ifelse("£" == c(str_match(msg_tbl$text, "£")), 1, 0))%>%
+  mutate(has_pound = ifelse(is.na(has_pound), 0,  has_pound))%>%
+  mutate(has_pound = factor(has_pound))
+
+msg_tbl <- msg_tbl %>%
+  mutate(has_dollar =  ifelse("$" == c(str_match(msg_tbl$text, "$")), 1, 0))%>%
+  mutate(has_dollar = ifelse(is.na(has_dollar), 0,  has_dollar))%>%
+  mutate(has_dollar = factor(has_dollar))
+
+summary(msg_tbl) # 2NAs in the word count column
+
+msg_tbl <- msg_tbl %>%
+  mutate(word_count = ifelse(is.na(word_count), 0, word_count))
+```
+
+## Exploring Features
+
+Going over the summary of our data set, we see that there is only one level (0) for `has_dollar`, meaning none of the texts had a dollar sign for some reason. It is safe to just remove it. 
+
+Calculating the proportions of each type of texts, we find that our data set is unbalanced. There are more observations of ham texts than spam ones; 87.4% of texts are ham, and 12.6% of them are spam. We need to be keep this in mind when we evaluate the accuracy of the model; we need to make sure the sensitivity and specificity are balanced. 
+
+```{r, include = FALSE}
+summary(msg_tbl)
+msg_tbl <- select(msg_tbl, c(-has_dollar))
+```
+
+```{r, echo = FALSE}
+msg_tbl %>%
+  group_by(type) %>%
+  summarize(n = n()) %>%
+  mutate(proportion = n/sum(n))
+
+```
+
+Looking at our plots for the counts, we can easily see that all of the median counts are higher for spam texts although are outliers for ham texts. For our binary variables, spam texts tend to have emoticons and `£` more so than real texts. 
+
+```{r, echo = FALSE}
+#Exploratory Viz
+
+a <- msg_tbl %>%
+  ggplot(mapping = aes(x = type, y = sentences_count, fill = type))+
+  geom_boxplot(show.legend = FALSE)
+
+b<- msg_tbl %>%
+  ggplot(mapping = aes(x = type, y = word_count, fill = type))+
+  geom_boxplot(show.legend = FALSE)
+
+c<-msg_tbl %>%
+  ggplot(mapping = aes(x = type, y = char_count, fill = type))+
+  geom_boxplot(show.legend = FALSE)
+
+d<-msg_tbl %>%
+  ggplot(mapping = aes(x = type, y = word_count, fill = type))+
+  geom_boxplot(show.legend = FALSE)
+
+e<-msg_tbl %>%
+  ggplot(mapping = aes(x = type, y = upperCase_count , fill = type))+
+  geom_boxplot(show.legend = FALSE)
+
+f<-msg_tbl %>%
+  ggplot(mapping = aes(x = type, y = num_count , fill = type))+
+  geom_boxplot(show.legend = FALSE)
+
+ggarrange(a, b, c, ncol = 3, nrow = 1)
+ggarrange(d, e, f, ncol = 3, nrow = 1)
+
+g<- msg_tbl %>%
+  group_by(type) %>%
+  mutate(has_emoticon = ifelse(has_emoticon == 1, 1, 0)) %>%
+  summarise(Yes = sum(as.double(has_emoticon)/n())) %>%
+  mutate(No = 1- Yes) %>%
+  pivot_longer(2:3, names_to = "Emoticon_Presence", values_to = "Proportion") %>%
+  ggplot(mapping = aes(x = type, y = Proportion, fill = Emoticon_Presence))+
+  geom_col(position = "fill")
+
+h<- msg_tbl %>%
+  group_by(type) %>%
+  mutate(has_pound = ifelse(has_pound == 1, 1, 0)) %>%
+  summarise(Yes = sum(as.double(has_pound)/n())) %>%
+  mutate(No = 1- Yes) %>%
+  pivot_longer(2:3, names_to = "£_Presence", values_to = "Proportion") %>%
+  ggplot(mapping = aes(x = type, y = Proportion, fill = `£_Presence`))+
+  geom_col(position = "fill")
+
+ggarrange(g, h, ncol = 2, nrow = 1)
+
+```
+
+
+## Using Lasso Regularization Technique
+
+We created seven different predictors for text type in the previous section. Even though we saw that the texts do differ based on these attributes, we do not really know if all predictors are equally important.To this end, we can make use of a regularization technique to select the variables that are more important.
+
+In Lasso regularization, we minimize the sum of $\lambda$ times the absolute value of all of our coefficients. Here, $\lambda$ is the penalty term that we will tune by using cross-validation with 10 folds and varying $lamda$ from $0.01$ to $1$.
+
+```{r, include = FALSE}
+set.seed(123456)
+msg_tbl <- select(msg_tbl, c(-id, -text))
+
+spam_split <- initial_split(msg_tbl, prop = 0.7)
+spam_train_tbl <- training(spam_split)
+spam_test_tbl <- testing(spam_split)
+```
+
+
+```{r, include = FALSE}
+spam_model <- logistic_reg(mixture = 1, penalty =  tune()) %>%
+  set_mode("classification") %>%
+  set_engine("glmnet")
+
+
+spam_recipe <- recipe(formula = type ~ ., data = spam_train_tbl) %>%
+step_normalize() %>%
+  step_dummy(all_nominal_predictors())
+
+spam_wf <- workflow() %>%
+  add_recipe(spam_recipe) %>%
+  add_model(spam_model)
+```
+
+The plot shows us how increasing the penalty affects the accuracy of the model. It seems the smallest penalty offers the best accuracy. Thus, we pick 0.01 as our penalty.
+
+```{r}
+#cross validation
+set.seed(1234)
+spam_fold <- vfold_cv(spam_train_tbl, v = 10)
+
+penalty_grid <- 
+  grid_regular(penalty(range = c(-2,0)), levels = 40)
+
+tune_result <- tune_grid(
+  spam_wf, 
+  resamples = spam_fold, 
+  grid = penalty_grid
+)
+
+autoplot(tune_result, metric = "accuracy")
+```
+ 
+```{r, include = FALSE}
+show_best(tune_result, metric = "accuracy")
+(best_penalty <- select_best(tune_result, metric = "accuracy"))
+
+#finalize workflow
+spam_final_wf <- 
+  finalize_workflow(spam_wf, best_penalty)
+
+#finalize fit
+spam_final_fit <- fit(spam_final_wf, data = spam_train_tbl)
+
+```
+ 
+The bar plot for the most important variables shows that presence/absence of pound and emoticon are very important to the model.  
+
+```{r, echo = FALSE}
+#most important variables
+extract_fit_parsnip(spam_final_fit) %>%
+  vip()
+```
+
+
+Similarly, looking at the coefficients, we see that `word_count` and `sentence_count` both are eliminated. 
+
+```{r, echo = FALSE}
+tidy(spam_final_fit) %>%
+  filter(estimate != 0  & term != "(Intercept)") %>%
+  arrange(desc(abs(estimate)))
+
+```
+
+The accuracy and the specificity of the model are 0.977 and 0.997, which is very high. However, the sensitivity is considerably low at 0.832, which means our model is worse at identifying spams. 
+
+```{r, echo = FALSE}
+spam_test_pred <- augment(spam_final_fit, new_data = spam_test_tbl) 
+
+class_metric <- metric_set(accuracy, sens, spec)
+
+spam_test_pred%>%
+  conf_mat(truth = type, estimate = .pred_class) 
+
+
+spam_test_pred %>%
+  class_metric(type, estimate = .pred_class)
+
+```
+
+To balance out the sensitivity and specificity, we can change the default threshold of 0.5. To do this, we create a tibble `roc_tbl` with all possible thresholds and the resulting sensitivity and specificity. 
+
+Then we can look for a threshold that gives a sensitivity of around 0.90. Note that we do not go for higher values because we do not want the specificity to be affected significantly, which could cause the classifier to flag real texts as spam.
+
+
+```{r, results='hide'}
+#balancing sensitivity and specificity
+roc_tbl <- roc_curve(spam_test_pred, type,
+.pred_spam)
+```
+
+```{r, echo = FALSE}
+roc_tbl %>%
+filter(between(sensitivity, 0.90,0.91))
+```
+
+With the new threshold 0.144, we get an improved sensitivity of 0.908 without reducing the specificity by a whole lot. 
+
+```{r, echo = FALSE}
+
+spam_test_pred <- spam_test_pred %>%
+  mutate(new_pred = ifelse(.pred_spam > 0.144, "spam", "ham"), 
+         new_pred = factor(new_pred, levels = spam_levels))
+
+spam_test_pred%>%
+  conf_mat(truth = type, estimate = new_pred) 
+
+
+spam_test_pred %>%
+  class_metric(type, estimate = new_pred)
+```
+
+## Switching to Random Forest (Ensemble Method)
+
+Recursive partitioning trees, also known as decision trees,is a machine learning algorithm that can be used for both classification and regression tasks. Basically, we recursively split the data into subsets based on the values of one or more input variables such that we end up creating a tree-like structure with a certain depth. 
+
+In the random forest approach for classification, we use bootstrapping to create multiple subsets of our training dataset. Then for each subset, we randomly choose a fixed number of predictors and build a tree; using a subset of our predictors decorrelates our trees. Finally, we classify an input according to the majority classification. 
+
+Here, we generate 1000 trees and tune parameter `min_n()` to control the minimum number of observations in each node and `m_try()` to control the number of predictors chosen for each tree in the forest. 
+
+```{r, echo = FALSE}
+#model spec
+random_forest_spec <- rand_forest(trees = 1000, mtry = tune(), min_n = tune()) %>%
+  set_mode("classification") %>%
+  set_engine("ranger", importance = "impurity")
+
+#recipe
+forest_recipe <- recipe(type ~., data=spam_train_tbl) %>%
+  step_normalize() %>%
+  step_dummy(all_nominal_predictors())
+
+
+#workflow
+forest_wflow <- workflow() %>%
+    add_recipe(forest_recipe) %>%
+    add_model(random_forest_spec) 
+
+
+spam_grid <- grid_regular(
+  mtry(range = c(2, 7)), 
+  min_n(range = c(2, 10))
+)
+
+#Tuning
+spam_res <-
+  tune_grid(
+    forest_wflow,
+    resamples = spam_fold,
+    grid = spam_grid,
+    metrics = metric_set(accuracy))
+```
+
+
+```{r, echo = FALSE}
+(best_param <- select_best(spam_res,metric = "accuracy"))
+
+rf_final_wf <- finalize_workflow(forest_wflow,  best_param)
+
+rf_final_fit <- fit(rf_final_wf, spam_train_tbl)
+```
+
+From the plot below, we can see that a minimal node size of 10 and 4 randomly selected predictors give us the best accuracy. Similarly, we the bar plot for variable importance shows us that `num_count` is considerably more important in this model. 
+
+```{r, echo = FALSE}
+autoplot(spam_res)
+```
+
+```{r, echo = FALSE}
+rf_final_fit %>%
+extract_fit_engine() %>%
+vip::vip()
+```
+
+
+The random forest model gives us an accuracy of 0.987, sensitivity of 0.914, and specificity of 0.997. The confusion matrix shows that 4 ham and 16 spam messages were misclassified. 
+
+```{r, echo = FALSE}
+augment(rf_final_fit, spam_test_tbl) %>%
+  class_metric(truth=type, estimate= .pred_class)
+
+augment(rf_final_fit, spam_test_tbl) %>%
+    conf_mat(truth=type, estimate= .pred_class)
+```
+
+
+
+## Conclusion 
+
+Both models perform relatively well on this data. The logistic model using lasso regularization is worse at identifying spams at the default threshold. After reducing the threshold to 0.144, however, we got an accuracy of 0.974, sensitivity of 0.908, and specificity of 0.983. The model uses 5 out of 7 variables which (in the decreasing order of importance) are `has_pound`, `has_emoticon`, `num_count`, `upperCase_count`, and `char_count`.
+
+Random Forest gives a slightly better accuracy of 0.987. Sensitivity and specificity are are also improved at 0.914 and 0.997 respectively. The top 4 important variable are`num_count`, `upperCase_count`, `char_count`, and `word_count`. Presence of pound and emoticon are apparently not so important in this model. A high accuracy like this could be too good to be in the real world. For instance, in this data ham texts used emoticons to a lesser extent, which might not hold true for today's context. To build a more robust model, we should train it on a larger and newer corpus of texts that includes users from all around the world, not just from the U.K. and Singapore. 
